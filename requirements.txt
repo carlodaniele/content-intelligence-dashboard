@@ -1,0 +1,6 @@
+streamlit==1.65.0
+pandas==3.0.6
+plotly==7.1.0
+chromadb==1.5.9
+google-genai==2.29.0
+python-dotenv==1.2.4
