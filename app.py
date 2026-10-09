@@ -1,7 +1,10 @@
 import os
 import re
+from datetime import datetime, timezone
+from html import escape
 from pathlib import Path
 from urllib.parse import urlparse
+from uuid import uuid4
 
 from dotenv import load_dotenv
 
@@ -11,18 +14,22 @@ import chromadb
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import streamlit.components.v2 as components
+from streamlit.errors import StreamlitSecretNotFoundError
 from google import genai
 from google.genai import types
+from suggested_questions import load_question_config, normalize_question, save_question_config
 
 
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / "data"
 CHROMA_DIR = ROOT_DIR / "chroma_db"
+QUESTION_CONFIG_PATH = Path(os.getenv("SUGGESTED_QUESTIONS_CONFIG", str(ROOT_DIR / "suggested_questions.json"))).expanduser()
 COLLECTION_NAME = "website_content"
 CHAT_MODEL = "gemini-2.5-flash"
 EMBEDDING_MODEL = "gemini-embedding-001"
 EMBED_BATCH_SIZE = 64
-CHAT_RESULT_COUNT = 6
+CHAT_RESULT_COUNT = 8
 REQUIRED_COLUMNS = [
 	"URL",
 	"Title",
@@ -37,7 +44,115 @@ REQUIRED_COLUMNS = [
 ]
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+saved_chat_storage = components.component(
+	"saved_chat_storage",
+	js="""
+	export default function(component) {
+		const { data, parentElement, setStateValue } = component;
+		const storageKey = 'content-intelligence.saved-chats.v1';
+		const synchronize = (applyOperation) => {
+			let snapshot;
+			try {
+				let items = JSON.parse(localStorage.getItem(storageKey) || '[]');
+				if (!Array.isArray(items) || items.some(item =>
+					!item || typeof item.id !== 'string' || typeof item.question !== 'string'
+					|| typeof item.answer !== 'string' || !Array.isArray(item.sources))) {
+					throw new Error('Saved conversations have an invalid format.');
+				}
+				const operation = applyOperation ? data.operation : null;
+				if (operation) {
+					items = items.filter(item => item.id !== operation.item_id);
+					if (operation.action === 'save') items.unshift(operation.item);
+					localStorage.setItem(storageKey, JSON.stringify(items));
+				}
+				snapshot = { items, operation_id: data.operation?.id || null, error: null };
+			} catch (error) {
+				snapshot = { items: null, operation_id: data.operation?.id || null, error: error.message };
+			}
+			const serialized = JSON.stringify(snapshot);
+			if (parentElement.savedChatSnapshot !== serialized) {
+				parentElement.savedChatSnapshot = serialized;
+				if (JSON.stringify(data.snapshot) !== serialized) setStateValue('snapshot', snapshot);
+			}
+		};
+		synchronize(true);
+		const onStorage = event => {
+			if (event.key === storageKey || event.key === null) synchronize(false);
+		};
+		window.addEventListener('storage', onStorage);
+		return () => window.removeEventListener('storage', onStorage);
+	}
+	""",
+)
+
+question_preferences_storage = components.component(
+	"question_preferences_storage",
+	js=r"""
+	export default function(component) {
+		const { data, parentElement, setStateValue } = component;
+		const storageKey = 'content-intelligence.question-preferences.v1';
+		const synchronize = (applyOperation) => {
+			let snapshot;
+			try {
+				let preferences = JSON.parse(localStorage.getItem(storageKey) ||
+					'{"version":1,"favorites":[],"hidden_shared_ids":[]}');
+				if (!preferences || preferences.version !== 1 || !Array.isArray(preferences.favorites)
+					|| !Array.isArray(preferences.hidden_shared_ids)
+					|| preferences.hidden_shared_ids.some(id => typeof id !== 'string')
+					|| preferences.favorites.some(item => !item || typeof item.id !== 'string'
+						|| typeof item.text !== 'string' || !item.text.trim() || item.text.length > 1000)
+					|| new Set(preferences.favorites.map(item => item.id)).size !== preferences.favorites.length) {
+					throw new Error('Question preferences have an invalid format.');
+				}
+				const operation = applyOperation ? data.operation : null;
+				if (operation) {
+					if (operation.action === 'add') {
+						if (!preferences.favorites.some(item => item.id === operation.question.id)) {
+							if (preferences.favorites.some(item => item.text.toLowerCase() === operation.question.text.toLowerCase())) {
+								throw new Error('This favorite question already exists.');
+							}
+							preferences.favorites.push(operation.question);
+						}
+					} else if (operation.action === 'delete') {
+						preferences.favorites = preferences.favorites.filter(item => item.id !== operation.question.id);
+					} else if (operation.action === 'hide') {
+						preferences.hidden_shared_ids = [...new Set([...preferences.hidden_shared_ids, operation.question.id])];
+					} else if (operation.action === 'restore') {
+						preferences.hidden_shared_ids = [];
+					}
+					localStorage.setItem(storageKey, JSON.stringify(preferences));
+				}
+				snapshot = { preferences, operation_id: data.operation?.id || null, error: null };
+			} catch (error) {
+				snapshot = { preferences: null, operation_id: data.operation?.id || null, error: error.message };
+			}
+			const serialized = JSON.stringify(snapshot);
+			if (parentElement.questionPreferencesSnapshot !== serialized) {
+				parentElement.questionPreferencesSnapshot = serialized;
+				if (JSON.stringify(data.snapshot) !== serialized) setStateValue('snapshot', snapshot);
+			}
+		};
+		synchronize(true);
+		const onStorage = event => {
+			if (event.key === storageKey || event.key === null) synchronize(false);
+		};
+		window.addEventListener('storage', onStorage);
+		return () => window.removeEventListener('storage', onStorage);
+	}
+	""",
+)
+
 st.set_page_config(page_title="Content Intelligence", page_icon="📚", layout="wide")
+
+try:
+	app_active = st.secrets.get("APP_ACTIVE", False)
+except StreamlitSecretNotFoundError:
+	app_active = False
+
+if app_active is not True:
+	st.info("Siamo spiacenti, l'applicazione è momentaneamente offline per manutenzione ordinaria. Riprova più tardi.")
+	st.stop()
+
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -187,7 +302,7 @@ def valid_http_url(value):
 	return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
-def render_sources(sources):
+def render_sources(sources, key_prefix="source"):
 	if not sources:
 		return
 	with st.expander("Sources Used"):
@@ -196,7 +311,7 @@ def render_sources(sources):
 			site = clean_text(source.get("Sito"))
 			st.markdown(f"**{index}. {title}** · {site}")
 			if valid_http_url(source.get("URL")):
-				st.link_button("Open article", clean_text(source["URL"]), key=f"source_{index}_{site}_{title[:24]}")
+				st.link_button("Open article", clean_text(source["URL"]), key=f"{key_prefix}_{index}_{site}_{title[:24]}")
 			else:
 				st.caption("URL is unavailable or invalid.")
 
@@ -355,142 +470,412 @@ def render_dashboard(frame):
 		st.plotly_chart(publication_figure, width="stretch")
 	else:
 		st.info("No valid publication dates are available for the selected range.")
-	st.divider()
 
-	treemap_data = frame[["Sito", "Category", "Topic"]].copy()
-	treemap_data["Category"] = treemap_data["Category"].fillna("").astype(str).str.strip()
-	treemap_data["Topic"] = treemap_data["Topic"].fillna("").astype(str).str.strip()
-	treemap_data["Category"] = treemap_data["Category"].replace("", "Uncategorized")
-	treemap_data["Topic"] = treemap_data["Topic"].replace("", "Unspecified topic")
-	treemap_data["Articles"] = 1
-	treemap_figure = px.treemap(
-		treemap_data,
-		path=["Sito", "Category", "Topic"],
-		values="Articles",
-		color="Articles",
-		color_continuous_scale="Viridis",
-		title="Content Hierarchy by Website, Category, and Topic",
-		labels={"Sito": "Website", "Category": "Category", "Topic": "Topic", "Articles": "Articles"},
+
+def queue_saved_chat_operation(action, item):
+	st.session_state["_saved_chat_operation"] = {
+		"id": str(uuid4()),
+		"action": action,
+		"item_id": item["id"],
+		"item": item if action == "save" else None,
+	}
+
+
+def render_saved_chats_sidebar():
+	st.session_state.setdefault("saved_chats", [])
+	st.session_state.setdefault("saved_chats_ready", False)
+	with st.sidebar:
+		st.divider()
+		st.subheader("Saved conversations")
+		result = saved_chat_storage(
+			data={"operation": st.session_state.get("_saved_chat_operation"), "snapshot": st.session_state.get("_last_saved_chat_snapshot")},
+			default={"snapshot": None},
+			key="saved_chat_browser_storage",
+			on_snapshot_change=lambda: None,
+		)
+		if snapshot := result.snapshot:
+			st.session_state["_last_saved_chat_snapshot"] = snapshot
+			st.session_state.saved_chats_ready = not snapshot.get("error")
+			if snapshot.get("error"):
+				st.warning(f"Browser storage is unavailable: {snapshot['error']}")
+			else:
+				st.session_state.saved_chats = snapshot["items"]
+			operation = st.session_state.get("_saved_chat_operation")
+			if operation and snapshot.get("operation_id") == operation["id"]:
+				st.session_state.pop("_saved_chat_operation")
+				if not snapshot.get("error"):
+					st.session_state["_saved_chat_notice"] = "Conversation saved." if operation["action"] == "save" else "Conversation deleted."
+				st.rerun()
+		if notice := st.session_state.pop("_saved_chat_notice", None):
+			st.success(notice)
+		if not st.session_state.saved_chats:
+			st.caption("No saved conversations.")
+		for item in st.session_state.saved_chats:
+			open_column, delete_column = st.columns([5, 1])
+			with open_column:
+				if st.button(item["question"], key=f"open_saved_{item['id']}", width="stretch", icon=":material/bookmark:"):
+					st.session_state.open_saved_chat = item["id"]
+			with delete_column:
+				st.button(
+					"", key=f"delete_saved_{item['id']}", icon=":material/delete:",
+					help="Delete saved conversation", disabled=not st.session_state.saved_chats_ready or bool(st.session_state.get("_saved_chat_operation")),
+					on_click=queue_saved_chat_operation, args=("delete", item),
+				)
+	if selected_id := st.session_state.pop("open_saved_chat", None):
+		selected_item = next((item for item in st.session_state.saved_chats if item["id"] == selected_id), None)
+		if selected_item:
+			show_saved_chat(selected_item)
+
+
+def conversation_export(item, file_format):
+	source_lines = []
+	for index, source in enumerate(item["sources"], start=1):
+		source_lines.append(
+			f"[Source {index}] {clean_text(source.get('Title'))} | {clean_text(source.get('Sito'))} | {clean_text(source.get('URL'))}"
+		)
+	scope = item.get("scope", {})
+	details = (
+		f"Created: {item.get('created_at', '')}\n"
+		f"Websites: {', '.join(scope.get('files', []))}\n"
+		f"Analysis time range: {scope.get('time_range', 'Not recorded')}"
 	)
-	treemap_figure.update_layout(margin=dict(t=55, l=0, r=0, b=0))
-	st.plotly_chart(treemap_figure, width="stretch")
+	if file_format == "HTML":
+		sources_html = "".join(f"<li>{escape(line)}</li>" for line in source_lines)
+		return (
+			'<!doctype html><html lang="en"><head><meta charset="utf-8">'
+			'<meta name="viewport" content="width=device-width, initial-scale=1">'
+			'<title>Content Strategy Conversation</title><style>'
+			'body{font-family:Georgia,serif;max-width:900px;margin:40px auto;padding:0 24px;line-height:1.6;}'
+			'pre{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;}li{overflow-wrap:anywhere;}'
+			'</style></head><body><h1>Content Strategy Conversation</h1>'
+			f'<pre>{escape(details)}</pre><h2>Question</h2><pre>{escape(item["question"])}</pre>'
+			f'<h2>Answer</h2><pre>{escape(item["answer"])}</pre><h2>Sources</h2><ul>{sources_html}</ul>'
+			'</body></html>'
+		)
+	if file_format == "Markdown":
+		return f"# Content Strategy Conversation\n\n{details}\n\n## Question\n\n{item['question']}\n\n## Answer\n\n{item['answer']}\n\n## Sources\n\n" + "\n\n".join(source_lines)
+	return f"Content Strategy Conversation\n\n{details}\n\nQuestion\n{item['question']}\n\nAnswer\n{item['answer']}\n\nSources\n" + "\n".join(source_lines)
+
+
+def remove_chat_exchange(exchange_id):
+	messages = st.session_state.get("messages", [])
+	for index, message in enumerate(messages):
+		if message["role"] == "assistant" and message.get("id") == exchange_id:
+			start = index
+			while start > 0 and messages[start]["role"] != "user":
+				start -= 1
+			end = index + 1
+			while end < len(messages) and messages[end]["role"] != "user":
+				end += 1
+			st.session_state.messages = messages[:start] + messages[end:]
+			return
+
+
+def render_conversation_actions(item, allow_save=True, key_prefix="chat"):
+	with st.container(horizontal=True):
+		if allow_save:
+			is_saved = any(saved["id"] == item["id"] for saved in st.session_state.get("saved_chats", []))
+			st.button(
+				"Saved" if is_saved else "Save", icon=":material/bookmark:", key=f"{key_prefix}_save_{item['id']}",
+				disabled=is_saved or not st.session_state.get("saved_chats_ready", False) or bool(st.session_state.get("_saved_chat_operation")),
+				on_click=queue_saved_chat_operation, args=("save", item),
+			)
+			st.button(
+				"", icon=":material/delete:", key=f"{key_prefix}_delete_{item['id']}",
+				help="Remove question and answer from chat history",
+				on_click=remove_chat_exchange, args=(item["id"],),
+			)
+		file_format = st.selectbox("Export format", ["Markdown", "Text", "HTML"], key=f"{key_prefix}_format_{item['id']}", width=160, label_visibility="collapsed")
+		extension, mime = {"Markdown": ("md", "text/markdown"), "Text": ("txt", "text/plain"), "HTML": ("html", "text/html")}[file_format]
+		st.download_button(
+			"Download", icon=":material/download:", data=conversation_export(item, file_format),
+			file_name=f"content_strategy_{item['id']}.{extension}", mime=mime,
+			key=f"{key_prefix}_download_{item['id']}", on_click="ignore",
+		)
+
+
+@st.dialog("Saved conversation", width="large")
+def show_saved_chat(item):
+	with st.chat_message("user"):
+		st.markdown(item["question"])
+	with st.chat_message("assistant"):
+		st.markdown(item["answer"])
+		render_sources(item["sources"], key_prefix=f"saved_{item['id']}")
+	scope = item.get("scope", {})
+	st.caption(f"{item.get('created_at', '')} · {', '.join(scope.get('files', []))} · {scope.get('time_range', '')}")
+	render_conversation_actions(item, allow_save=False, key_prefix="saved")
+
+
+def generate_chat_answer(prompt, collection):
+	allowed_document_ids = {
+		f"{clean_text(row['_source_file'])}::{row_number}"
+		for row_number, row in dataset.iterrows()
+	}
+	if not allowed_document_ids:
+		return None
+	indexed_count = collection.count()
+	if not indexed_count:
+		return None
+	client = get_genai_client(GEMINI_API_KEY)
+	query_embedding = embed_texts(client, [prompt], "RETRIEVAL_QUERY")[0]
+	mentioned_sites = [
+		site
+		for site in sorted(dataset["Sito"].dropna().astype(str).unique(), key=len, reverse=True)
+		if re.search(rf"(?<!\w){re.escape(site)}(?!\w)", prompt, flags=re.IGNORECASE)
+	]
+	candidates = []
+	if mentioned_sites:
+		base_count, remainder = divmod(CHAT_RESULT_COUNT, len(mentioned_sites))
+		for site_index, site in enumerate(mentioned_sites):
+			per_site = max(1, base_count + (site_index < remainder))
+			site_candidates = []
+			site_results = collection.query(
+				query_embeddings=[query_embedding],
+				n_results=indexed_count,
+				where={"Sito": site},
+				include=["documents", "metadatas", "distances"],
+			)
+			for document_id, document, metadata, distance in zip(
+				site_results.get("ids", [[]])[0],
+				site_results.get("documents", [[]])[0],
+				site_results.get("metadatas", [[]])[0],
+				site_results.get("distances", [[]])[0],
+			):
+				if document_id in allowed_document_ids:
+					site_candidates.append((distance, document, metadata))
+			site_candidates.sort(key=lambda item: item[0])
+			candidates.extend(site_candidates[:per_site])
+		candidates.sort(key=lambda item: item[0])
+		documents = [item[1] for item in candidates[:CHAT_RESULT_COUNT]]
+		metadatas = [item[2] for item in candidates[:CHAT_RESULT_COUNT]]
+	else:
+		results = collection.query(
+			query_embeddings=[query_embedding],
+			n_results=indexed_count,
+			include=["documents", "metadatas", "distances"],
+		)
+		filtered_results = [
+			(document, metadata)
+			for document_id, document, metadata in zip(
+				results.get("ids", [[]])[0],
+				results.get("documents", [[]])[0],
+				results.get("metadatas", [[]])[0],
+			)
+			if document_id in allowed_document_ids
+		][:CHAT_RESULT_COUNT]
+		documents = [item[0] for item in filtered_results]
+		metadatas = [item[1] for item in filtered_results]
+	if not documents:
+		return None
+	sources = []
+	context_blocks = []
+	for index, (document, metadata) in enumerate(zip(documents, metadatas), start=1):
+		metadata = metadata or {}
+		sources.append(metadata)
+		context_blocks.append(
+			f"[Source {index}] Website: {metadata.get('Sito', '')}; "
+			f"Title: {metadata.get('Title', '')}; URL: {metadata.get('URL', '')}\n{document}"
+		)
+
+	answer_prompt = (
+		"You are a content strategy analyst. Respond in US English with a detailed, practical comparison "
+		"based only on the provided sources. Distinguish facts from inferences, note when the data is "
+		"insufficient, and cite sources in the answer as [Source 1].\n\n"
+		f"QUESTION:\n{prompt}\n\nRETRIEVED CONTEXT:\n" + "\n\n".join(context_blocks)
+	)
+	response = client.models.generate_content(model=CHAT_MODEL, contents=answer_prompt)
+	return response.text or "Gemini did not return a text response.", sources
+
+
+def queue_question_preference_operation(action, question=None):
+	st.session_state["_question_preference_operation"] = {"id": str(uuid4()), "action": action, "question": question}
+
+
+def render_question_preferences_storage():
+	st.session_state.setdefault("question_preferences", {"version": 1, "favorites": [], "hidden_shared_ids": []})
+	st.session_state.setdefault("question_preferences_ready", False)
+	result = question_preferences_storage(
+		data={"operation": st.session_state.get("_question_preference_operation"), "snapshot": st.session_state.get("_last_question_preferences_snapshot")},
+		default={"snapshot": None}, key="question_preferences_browser_storage", on_snapshot_change=lambda: None,
+	)
+	if snapshot := result.snapshot:
+		st.session_state["_last_question_preferences_snapshot"] = snapshot
+		st.session_state.question_preferences_ready = not snapshot.get("error")
+		if snapshot.get("error"):
+			st.warning(f"Question preferences could not be saved or loaded: {snapshot['error']}")
+		else:
+			st.session_state.question_preferences = snapshot["preferences"]
+		operation = st.session_state.get("_question_preference_operation")
+		if operation and snapshot.get("operation_id") == operation["id"]:
+			st.session_state.pop("_question_preference_operation")
+			if snapshot.get("error"):
+				st.session_state["_question_error"] = f"Could not save question preferences: {snapshot['error']}"
+			else:
+				st.session_state["_question_notice"] = "Question preferences saved."
+			st.rerun()
+
+
+def add_favorite_question(shared_questions):
+	try:
+		text = normalize_question(st.session_state.get("favorite_question_text", ""))
+		preferences = st.session_state.question_preferences
+		existing = preferences["favorites"] + [
+			question for question in shared_questions
+			if question["enabled"] and question["id"] not in preferences["hidden_shared_ids"]
+		]
+		if any(question["text"].casefold() == text.casefold() for question in existing):
+			raise ValueError("This question already exists.")
+		queue_question_preference_operation("add", {"id": str(uuid4()), "text": text})
+		st.session_state.favorite_question_text = ""
+	except ValueError as exc:
+		st.session_state["_question_error"] = str(exc)
+
+
+def shared_question_editing_allowed():
+	if os.getenv("ALLOW_SHARED_QUESTION_EDITING", "").lower() == "true":
+		return True
+	try:
+		return st.secrets.get("ALLOW_SHARED_QUESTION_EDITING", False) is True
+	except StreamlitSecretNotFoundError:
+		return False
+
+
+@st.dialog("Shared question settings", width="large")
+def show_question_settings(config):
+	can_edit = shared_question_editing_allowed()
+	rows = [{"id": question["id"], "Position": index + 1, "Question": question["text"], "Enabled": question["enabled"]}
+		for index, question in enumerate(config["suggested_questions"])]
+	with st.form("shared_question_settings_form"):
+		edited = st.data_editor(
+			pd.DataFrame(rows, columns=["id", "Position", "Question", "Enabled"]),
+			key="shared_question_editor", hide_index=True, num_rows="dynamic", height=400, disabled=not can_edit,
+			column_config={"id": None, "Position": st.column_config.NumberColumn(min_value=1, step=1),
+				"Question": st.column_config.TextColumn(required=True, max_chars=1000, width="large"),
+				"Enabled": st.column_config.CheckboxColumn(default=True, required=True)},
+		)
+		submitted = st.form_submit_button("Save shared questions", icon=":material/save:", disabled=not can_edit)
+	if submitted and can_edit:
+		try:
+			questions = []
+			for index, row in enumerate(edited.to_dict("records")):
+				position = index + 1 if pd.isna(row.get("Position")) else int(row["Position"])
+				questions.append((position, {"id": row["id"] if isinstance(row.get("id"), str) else str(uuid4()),
+					"text": row["Question"], "enabled": row["Enabled"]}))
+			updated = {"version": 1, "suggested_questions": [question for position, question in sorted(questions, key=lambda item: item[0])]}
+			save_question_config(QUESTION_CONFIG_PATH, updated, config)
+			st.session_state["_question_notice"] = "Shared questions saved."
+			st.rerun()
+		except (OSError, ValueError, TypeError) as exc:
+			st.error(f"Could not save shared questions: {exc}")
+
+
+def render_suggested_questions():
+	try:
+		config = load_question_config(QUESTION_CONFIG_PATH)
+	except (OSError, ValueError) as exc:
+		st.warning(f"Shared questions could not be loaded: {exc}")
+		config = None
+	shared_questions = config["suggested_questions"] if config else []
+	preferences = st.session_state.question_preferences
+	questions = [(question, "delete") for question in preferences["favorites"]]
+	questions += [(question, "hide") for question in shared_questions
+		if question["enabled"] and question["id"] not in preferences["hidden_shared_ids"]]
+	busy = not st.session_state.question_preferences_ready or bool(st.session_state.get("_question_preference_operation"))
+	with st.expander("Suggested questions", key="suggested_questions_open", on_change="rerun"):
+		if notice := st.session_state.pop("_question_notice", None):
+			st.success(notice)
+		if error := st.session_state.pop("_question_error", None):
+			st.error(error)
+		if questions:
+			with st.container(height=min(400, len(questions) * 80 - 16), border=False, key="suggested_questions_list"):
+				for question, action in questions:
+					question_column, delete_column = st.columns([5, 1], gap="small")
+					with question_column:
+						st.button(question["text"], key=f"suggested_question_{action}_{question['id']}",
+							icon=":material/bookmark:" if action == "delete" else ":material/chat:", width="stretch",
+							help=question["text"], on_click=queue_suggested_question, args=(question["text"],))
+					with delete_column:
+						st.button("", key=f"remove_question_{action}_{question['id']}", icon=":material/delete:",
+							help="Remove favorite question" if action == "delete" else "Hide shared question in this browser",
+							disabled=busy, on_click=queue_question_preference_operation, args=(action, question))
+		else:
+			st.caption("No suggested questions.")
+		with st.form("add_favorite_question_form"):
+			st.text_input("Favorite question", key="favorite_question_text", max_chars=1000)
+			st.form_submit_button("Add favorite", icon=":material/add:", disabled=busy,
+				on_click=add_favorite_question, args=(shared_questions,))
+		with st.container(horizontal=True):
+			if st.button("Shared settings", icon=":material/settings:", disabled=config is None):
+				show_question_settings(config)
+			if preferences["hidden_shared_ids"]:
+				st.button("Restore shared questions", icon=":material/undo:", disabled=busy,
+					on_click=queue_question_preference_operation, args=("restore",))
+
+
+def queue_suggested_question(question):
+	st.session_state.suggested_chat_prompt = question
+	st.session_state.suggested_questions_open = False
 
 
 def render_chat():
-	if "messages" not in st.session_state:
-		st.session_state.messages = []
-
-	for message in st.session_state.messages:
-		with st.chat_message(message["role"]):
-			st.markdown(message["content"])
-			if message["role"] == "assistant":
-				render_sources(message.get("sources", []))
-
-	if prompt := st.chat_input("Ask a comparative question about the content..."):
+	st.session_state.setdefault("messages", [])
+	st.html("""<style>
+		div:has(> .st-key-chat_composer) {position: sticky; top: 3.75rem; z-index: 20;}
+		.st-key-chat_composer {background: var(--background-color); padding: 0.5rem 0;}
+		.st-key-suggested_questions_list [data-testid="stHorizontalBlock"] {flex-wrap: nowrap;}
+		.st-key-suggested_questions_list [data-testid="stColumn"] {min-width: 0;}
+		.st-key-suggested_questions_list button {height: 64px;}
+		.st-key-suggested_questions_list button p {display: -webkit-box;
+			-webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;}
+	</style>""")
+	with st.container(key="chat_composer"):
+		typed_prompt = st.chat_input("Ask a comparative question about the content...", key="comparative_chat_input")
+	render_suggested_questions()
+	prompt = st.session_state.pop("suggested_chat_prompt", None) or typed_prompt
+	if prompt:
 		if not GEMINI_API_KEY:
 			st.error("API key not found in the .env file. Check your configuration.")
-			return
-
-		collection = get_indexed_collection()
-		if collection is None:
-			st.warning("Database not indexed yet. Start ingestion from the sidebar first.")
-			return
-		if dataset.empty:
+		elif dataset.empty:
 			st.warning("No articles match the selected time range.")
-			return
-
-		allowed_document_ids = {
-			f"{clean_text(row['_source_file'])}::{row_number}"
-			for row_number, row in dataset.iterrows()
-		}
-
-		st.session_state.messages.append({"role": "user", "content": prompt})
-		with st.chat_message("user"):
-			st.markdown(prompt)
-
-		try:
-			with st.chat_message("assistant"):
+		elif (collection := get_indexed_collection()) is None:
+			st.warning("Database not indexed yet. Start ingestion from the sidebar first.")
+		else:
+			try:
 				with st.spinner("Searching sources and preparing a comparative analysis..."):
-					client = get_genai_client(GEMINI_API_KEY)
-					query_embedding = embed_texts(client, [prompt], "RETRIEVAL_QUERY")[0]
-					mentioned_sites = [
-						site
-						for site in sorted(dataset["Sito"].dropna().astype(str).unique(), key=len, reverse=True)
-						if re.search(rf"(?<!\w){re.escape(site)}(?!\w)", prompt, flags=re.IGNORECASE)
-					]
-					candidates = []
-					if mentioned_sites:
-						per_site = max(1, CHAT_RESULT_COUNT // len(mentioned_sites))
-						for site in mentioned_sites:
-							site_candidates = []
-							if not collection.count():
-								continue
-							site_results = collection.query(
-								query_embeddings=[query_embedding],
-								n_results=collection.count(),
-								where={"Sito": site},
-								include=["documents", "metadatas", "distances"],
-							)
-							for document_id, document, metadata, distance in zip(
-								site_results.get("ids", [[]])[0],
-								site_results.get("documents", [[]])[0],
-								site_results.get("metadatas", [[]])[0],
-								site_results.get("distances", [[]])[0],
-							):
-								if document_id in allowed_document_ids:
-									site_candidates.append((distance, document, metadata))
-							site_candidates.sort(key=lambda item: item[0])
-							candidates.extend(site_candidates[:per_site])
-						candidates.sort(key=lambda item: item[0])
-						documents = [item[1] for item in candidates[:CHAT_RESULT_COUNT]]
-						metadatas = [item[2] for item in candidates[:CHAT_RESULT_COUNT]]
-					else:
-						results = collection.query(
-							query_embeddings=[query_embedding],
-							n_results=collection.count(),
-							include=["documents", "metadatas", "distances"],
-						)
-						filtered_results = [
-							(document, metadata)
-							for document_id, document, metadata in zip(
-								results.get("ids", [[]])[0],
-								results.get("documents", [[]])[0],
-								results.get("metadatas", [[]])[0],
-							)
-							if document_id in allowed_document_ids
-						][:CHAT_RESULT_COUNT]
-						documents = [item[0] for item in filtered_results]
-						metadatas = [item[1] for item in filtered_results]
-					if not documents:
-						st.warning("No indexed articles match the selected time range. Run data ingestion to refresh the index.")
-						return
-					sources = []
-					context_blocks = []
-					for index, (document, metadata) in enumerate(zip(documents, metadatas), start=1):
-						metadata = metadata or {}
-						sources.append(metadata)
-						context_blocks.append(
-							f"[Source {index}] Website: {metadata.get('Sito', '')}; "
-							f"Title: {metadata.get('Title', '')}; URL: {metadata.get('URL', '')}\n{document}"
-						)
+					result = generate_chat_answer(prompt, collection)
+				if result is None:
+					st.warning("No indexed articles match the selected time range. Run data ingestion to refresh the index.")
+				else:
+					answer, sources = result
+					st.session_state.messages.extend([
+						{"role": "user", "content": prompt},
+						{"role": "assistant", "content": answer, "sources": sources,
+						 "id": str(uuid4()), "created_at": datetime.now(timezone.utc).isoformat(),
+						 "scope": {"files": [path.name for path in selected_files], "time_range": analysis_time_range}},
+					])
+			except Exception as exc:
+				st.error(f"Error while searching or generating a Gemini response: {exc}")
 
-					answer_prompt = (
-						"You are a content strategy analyst. Respond in US English with a detailed, practical comparison "
-						"based only on the provided sources. Distinguish facts from inferences, note when the data is "
-						"insufficient, and cite sources in the answer as [Source 1].\n\n"
-						f"QUESTION:\n{prompt}\n\nRETRIEVED CONTEXT:\n" + "\n\n".join(context_blocks)
-					)
-					response = client.models.generate_content(model=CHAT_MODEL, contents=answer_prompt)
-					answer = response.text or "Gemini did not return a text response."
-					st.markdown(answer)
-					render_sources(sources)
-			st.session_state.messages.append(
-				{"role": "assistant", "content": answer, "sources": sources}
-			)
-		except Exception as exc:
-			error_message = f"Error while searching or generating a Gemini response: {exc}"
-			st.session_state.messages.append({"role": "assistant", "content": error_message, "sources": []})
-			st.error(error_message)
+	exchanges = []
+	for message in st.session_state.messages:
+		if message["role"] == "user":
+			exchanges.append([message])
+		elif exchanges:
+			exchanges[-1].append(message)
+	for exchange in reversed(exchanges):
+		for message in exchange:
+			with st.chat_message(message["role"]):
+				st.markdown(message["content"])
+				if message["role"] == "assistant":
+					message.setdefault("id", str(uuid4()))
+					render_sources(message.get("sources", []), key_prefix=message["id"])
+					item = {
+						"id": message["id"], "question": exchange[0]["content"], "answer": message["content"],
+						"sources": message.get("sources", []), "created_at": message.get("created_at", ""),
+						"scope": message.get("scope", {}),
+					}
+					render_conversation_actions(item)
+		st.divider()
 
 
 def render_report(frame):
@@ -529,11 +914,11 @@ def render_report(frame):
 files = scan_csv_files()
 all_dataset, all_csv_errors = load_dataset(files)
 with st.sidebar:
-	st.subheader("Detected CSV files")
+	st.subheader("Available competitors")
 	selected_files = []
 	if files:
 		for csv_file in files:
-			if st.checkbox(csv_file.name, value=True, key=f"data_source_{csv_file.name}"):
+			if st.checkbox(csv_file.stem, value=True, key=f"data_source_{csv_file.name}"):
 				selected_files.append(csv_file)
 	else:
 		st.caption("No CSV files found in `data/`.")
@@ -613,6 +998,10 @@ else:
 			& selected_dataset["Date published"].lt(end_exclusive)
 		].copy()
 
+with st.sidebar:
+	render_question_preferences_storage()
+render_saved_chats_sidebar()
+
 st.title("Content Intelligence")
 st.caption("Competitive content analysis, semantic search, and editorial strategy.")
 if not GEMINI_API_KEY:
@@ -621,7 +1010,8 @@ for csv_error in csv_errors:
 	st.warning(csv_error)
 
 dashboard_tab, chat_tab, report_tab = st.tabs(
-	["📊 Quantitative Dashboard", "🤖 AI Assistant & Comparative Chat", "📄 Strategic Report Generator"]
+	["📊 Quantitative Dashboard", "🤖 AI Assistant & Comparative Chat", "📄 Strategic Report Generator"],
+	key="content_views", on_change="rerun",
 )
 
 with dashboard_tab:

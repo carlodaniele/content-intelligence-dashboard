@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "suggested_questions": [
+    {"id": "funnel-comparison", "text": "How do competitors differ in their content mix across TOFU, MOFU, and BOFU, and which positioning opportunities does this reveal?", "enabled": true},
+    {"id": "topic-opportunities", "text": "Which topics are heavily covered by competitors, and which underrepresented topics are worth validating as content opportunities?", "enabled": true},
+    {"id": "publishing-frequency", "text": "How does publishing frequency differ across competitors over time, and what changes in editorial priorities are visible?", "enabled": true},
+    {"id": "audience-strategy", "text": "Which target audiences does each competitor prioritize, and where could a more differentiated audience strategy emerge?", "enabled": true},
+    {"id": "editorial-formats", "text": "How do article length and topic selection differ across competitors, and what editorial formats are worth testing?", "enabled": true},
+    {"id": "content-positioning", "text": "What recurring themes and value propositions distinguish each competitor's content positioning?", "enabled": true},
+    {"id": "educational-product-mix", "text": "Which competitors emphasize educational content versus product-led content, and how does that align with their funnel mix?", "enabled": true},
+    {"id": "differentiated-angles", "text": "Where are competitors publishing similar content, and how could our team develop a differentiated angle?", "enabled": true},
+    {"id": "next-initiatives", "text": "Based on the selected data, which three content initiatives should our team prioritize next, and what evidence supports each?", "enabled": true},
+    {"id": "strategy-changes", "text": "What has changed in competitors' content strategies between the earliest and latest periods in the selected data?", "enabled": true}
+  ]
+}
