@@ -30,14 +30,21 @@ CHAT_MODEL = "gemini-2.5-flash"
 EMBEDDING_MODEL = "gemini-embedding-001"
 EMBED_BATCH_SIZE = 64
 CHAT_RESULT_COUNT = 8
+CONTENT_SCHEMA_VERSION = 2
 REQUIRED_COLUMNS = [
+	"Date published",
 	"URL",
 	"Title",
-	"Date published",
-	"Category",
-	"Tags",
-	"Topic",
-	"Lenght",
+	"Post type",
+	"Topics",
+	"Vertical",
+	"Buyer persona",
+	"Sales pitch",
+	"Strategic initiative",
+	"Features Mentioned",
+	"Main Pain Point",
+	"Solution",
+	"Word count",
 	"Funnel stage",
 	"Target audience",
 	"Summary",
@@ -49,15 +56,16 @@ saved_chat_storage = components.component(
 	js="""
 	export default function(component) {
 		const { data, parentElement, setStateValue } = component;
-		const storageKey = 'content-intelligence.saved-chats.v1';
+		const storageKey = data.storage_key || 'content-intelligence.saved-chats.v1';
 		const synchronize = (applyOperation) => {
 			let snapshot;
 			try {
 				let items = JSON.parse(localStorage.getItem(storageKey) || '[]');
 				if (!Array.isArray(items) || items.some(item =>
-					!item || typeof item.id !== 'string' || typeof item.question !== 'string'
-					|| typeof item.answer !== 'string' || !Array.isArray(item.sources))) {
-					throw new Error('Saved conversations have an invalid format.');
+					!item || typeof item.id !== 'string' || (data.kind === 'report'
+						? typeof item.title !== 'string' || typeof item.content !== 'string'
+						: typeof item.question !== 'string' || typeof item.answer !== 'string' || !Array.isArray(item.sources)))) {
+					throw new Error('Saved items have an invalid format.');
 				}
 				const operation = applyOperation ? data.operation : null;
 				if (operation) {
@@ -206,9 +214,20 @@ def metadata_value(value):
 
 
 def article_length_series(frame):
-	values = frame["Lenght"].astype("string").str.replace(",", "", regex=False)
+	values = frame["Word count"].astype("string").str.replace(",", "", regex=False)
 	numbers = values.str.extract(r"([-+]?\d*\.?\d+)", expand=False)
 	return pd.to_numeric(numbers, errors="coerce")
+
+
+def article_document(row, max_field_chars=None):
+	lines = []
+	for column in REQUIRED_COLUMNS:
+		value = clean_text(row.get(column))
+		if value:
+			if max_field_chars is not None:
+				value = value[:max_field_chars]
+			lines.append(f"{column}: {value}")
+	return "\n".join(lines)
 
 
 @st.cache_resource
@@ -245,9 +264,7 @@ def ingest_dataset(frame, gemini_client, progress_callback):
 	metadatas = []
 	ids = []
 	for row_number, row in frame.iterrows():
-		title = clean_text(row.get("Title"))
-		summary = clean_text(row.get("Summary"))
-		documents.append(f"Title: {title}\nSummary: {summary}")
+		documents.append(article_document(row))
 
 		metadata = {"Sito": clean_text(row.get("Sito"))}
 		for column in frame.columns:
@@ -275,7 +292,7 @@ def ingest_dataset(frame, gemini_client, progress_callback):
 		pass
 	collection = chroma_client.create_collection(
 		name=COLLECTION_NAME,
-		metadata={"hnsw:space": "cosine"},
+		metadata={"hnsw:space": "cosine", "content_schema_version": CONTENT_SCHEMA_VERSION},
 	)
 
 	for start in range(0, len(documents), EMBED_BATCH_SIZE):
@@ -292,6 +309,8 @@ def ingest_dataset(frame, gemini_client, progress_callback):
 def get_indexed_collection():
 	try:
 		collection = get_chroma_client().get_collection(COLLECTION_NAME)
+		if (collection.metadata or {}).get("content_schema_version") != CONTENT_SCHEMA_VERSION:
+			return None
 		return collection if collection.count() else None
 	except Exception:
 		return None
@@ -327,14 +346,14 @@ def report_context(frame):
 		lines.append(f"\n## Website: {site}")
 		lines.append(f"Articles: {len(group)}")
 		if not site_lengths.empty:
-			lines.append(f"Average article length: {site_lengths.mean():.1f}; median: {site_lengths.median():.1f}")
+			lines.append(f"Average word count: {site_lengths.mean():.1f}; median: {site_lengths.median():.1f}")
 		if not site_dates.empty:
 			lines.append(f"Publication date range: {site_dates.min().date()} - {site_dates.max().date()}")
 
 		stages = group["Funnel stage"].dropna().astype(str).str.strip().str.upper().value_counts(normalize=True)
 		if not stages.empty:
 			lines.append("Funnel distribution (%): " + ", ".join(f"{name} {value * 100:.1f}%" for name, value in stages.items()))
-		for column in ("Topic", "Category", "Target audience"):
+		for column in ("Topics", "Post type", "Vertical", "Buyer persona", "Strategic initiative", "Features Mentioned", "Target audience"):
 			counts = group[column].dropna().astype(str).str.strip()
 			counts = counts[counts.ne("")].value_counts().head(6)
 			if not counts.empty:
@@ -343,12 +362,10 @@ def report_context(frame):
 		dated = group.assign(_report_date=pd.to_datetime(group["Date published"], errors="coerce", utc=True))
 		examples = dated.sort_values("_report_date", na_position="first").tail(3)
 		for _, article in examples.iterrows():
-			title = clean_text(article.get("Title"))
-			summary = clean_text(article.get("Summary"))[:350]
-			lines.append(f"Example: {title} - {summary}")
+			lines.append("Article example:\n" + article_document(article, max_field_chars=350))
 
 	if lengths.notna().any():
-		lines.append(f"\nOverall average article length: {lengths.mean():.1f}")
+		lines.append(f"\nOverall average word count: {lengths.mean():.1f}")
 	if published.notna().any():
 		lines.append(f"Overall publication date range: {published.min().date()} - {published.max().date()}")
 	return "\n".join(lines)
@@ -361,15 +378,18 @@ def render_dashboard(frame):
 
 	site_count = frame["Sito"].nunique()
 	article_count = len(frame)
-	topic_count = frame["Topic"].dropna().nunique()
+	topic_count = frame["Topics"].dropna().nunique()
 	metric_columns = st.columns(3)
 	metric_columns[0].metric("Websites", site_count)
 	metric_columns[1].metric("Articles", article_count)
 	metric_columns[2].metric("Unique topics", topic_count)
 
 	funnel = frame[["Sito", "Funnel stage"]].dropna().copy().rename(columns={"Sito": "Website"})
-	funnel["Funnel stage"] = funnel["Funnel stage"].astype(str).str.strip().str.upper()
-	funnel = funnel[funnel["Funnel stage"].ne("")]
+	funnel["Funnel stage"] = (
+		funnel["Funnel stage"].astype(str).str.strip().str.upper().str.replace(r"\s+", " ", regex=True)
+		.replace({"TOP OF FUNNEL": "TOFU", "MIDDLE OF FUNNEL": "MOFU", "BOTTOM OF FUNNEL": "BOFU"})
+	)
+	funnel = funnel[funnel["Funnel stage"].isin(["TOFU", "MOFU", "BOFU"])]
 	if not funnel.empty:
 		funnel_counts = funnel.groupby(["Website", "Funnel stage"]).size().reset_index(name="Articles")
 		funnel_counts["Percentage"] = (
@@ -380,6 +400,7 @@ def render_dashboard(frame):
 			x="Website",
 			y="Percentage",
 			color="Funnel stage",
+			category_orders={"Funnel stage": ["TOFU", "MOFU", "BOFU"]},
 			barmode="stack",
 			color_discrete_sequence=px.colors.qualitative.Vivid,
 			title="Funnel Stage Distribution by Website",
@@ -393,8 +414,8 @@ def render_dashboard(frame):
 	st.divider()
 
 	sites = sorted(frame["Sito"].dropna().astype(str).unique(), key=str.casefold)
-	dimension = st.selectbox("Analyze by", ["Topic", "Category"], key="topic_dimension")
-	selected_site = st.selectbox("Website for most frequent topics", ["All websites"] + sites)
+	dimension = st.selectbox("Analyze by", ["Topics", "Post type", "Vertical", "Buyer persona", "Strategic initiative", "Features Mentioned", "Target audience"], key="topic_dimension")
+	selected_site = st.selectbox("Website for most frequent values", ["All websites"] + sites)
 	topic_data = frame.copy()
 	if selected_site != "All websites":
 		topic_data = topic_data[topic_data["Sito"] == selected_site]
@@ -409,7 +430,7 @@ def render_dashboard(frame):
 			orientation="h",
 			color="Articles",
 			color_continuous_scale="Viridis",
-			title=f"Most Frequent {dimension}s",
+			title=f"Most Frequent {dimension}",
 		)
 		topic_figure.update_layout(coloraxis_showscale=False, yaxis_title="", xaxis_title="Articles")
 		st.plotly_chart(topic_figure, width="stretch")
@@ -430,10 +451,10 @@ def render_dashboard(frame):
 			color_discrete_sequence=px.colors.qualitative.Prism,
 			title="Article Length Comparison",
 		)
-		length_figure.update_layout(showlegend=False, xaxis_title="Website", yaxis_title="Article length")
+		length_figure.update_layout(showlegend=False, xaxis_title="Website", yaxis_title="Word count")
 		st.plotly_chart(length_figure, width="stretch")
 	else:
-		st.info("The `Lenght` column does not contain usable numeric values.")
+		st.info("The `Word count` column does not contain usable numeric values.")
 	st.divider()
 
 	dated_articles = frame.dropna(subset=["Date published"]).copy()
@@ -473,7 +494,15 @@ def render_dashboard(frame):
 
 
 def queue_saved_chat_operation(action, item):
-	st.session_state["_saved_chat_operation"] = {
+	queue_saved_item_operation(action, item, "chat")
+
+
+def queue_saved_report_operation(action, item):
+	queue_saved_item_operation(action, item, "report")
+
+
+def queue_saved_item_operation(action, item, kind):
+	st.session_state[f"_saved_{kind}_operation"] = {
 		"id": str(uuid4()),
 		"action": action,
 		"item_id": item["id"],
@@ -482,49 +511,81 @@ def queue_saved_chat_operation(action, item):
 
 
 def render_saved_chats_sidebar():
-	st.session_state.setdefault("saved_chats", [])
-	st.session_state.setdefault("saved_chats_ready", False)
+	render_saved_items_sidebar("chat", "question", show_saved_chat)
+
+
+def render_saved_reports_sidebar():
+	render_saved_items_sidebar("report", "title", show_saved_report)
+
+
+def render_saved_items_sidebar(kind, title_field, viewer):
+	items_key = f"saved_{kind}s"
+	ready_key = f"{items_key}_ready"
+	operation_key = f"_saved_{kind}_operation"
+	snapshot_key = f"_last_saved_{kind}_snapshot"
+	notice_key = f"_saved_{kind}_notice"
+	open_key = f"open_saved_{kind}"
+	noun = "conversation" if kind == "chat" else "report"
+	st.session_state.setdefault(items_key, [])
+	st.session_state.setdefault(ready_key, False)
 	with st.sidebar:
 		st.divider()
-		st.subheader("Saved conversations")
+		st.subheader("Saved conversations" if kind == "chat" else "Saved reports")
 		result = saved_chat_storage(
-			data={"operation": st.session_state.get("_saved_chat_operation"), "snapshot": st.session_state.get("_last_saved_chat_snapshot")},
+			data={"operation": st.session_state.get(operation_key), "snapshot": st.session_state.get(snapshot_key),
+				"kind": kind, "storage_key": f"content-intelligence.saved-{kind}s.v1"},
 			default={"snapshot": None},
-			key="saved_chat_browser_storage",
+			key=f"saved_{kind}_browser_storage",
 			on_snapshot_change=lambda: None,
 		)
 		if snapshot := result.snapshot:
-			st.session_state["_last_saved_chat_snapshot"] = snapshot
-			st.session_state.saved_chats_ready = not snapshot.get("error")
+			st.session_state[snapshot_key] = snapshot
+			st.session_state[ready_key] = not snapshot.get("error")
 			if snapshot.get("error"):
 				st.warning(f"Browser storage is unavailable: {snapshot['error']}")
 			else:
-				st.session_state.saved_chats = snapshot["items"]
-			operation = st.session_state.get("_saved_chat_operation")
+				st.session_state[items_key] = snapshot["items"]
+			operation = st.session_state.get(operation_key)
 			if operation and snapshot.get("operation_id") == operation["id"]:
-				st.session_state.pop("_saved_chat_operation")
-				if not snapshot.get("error"):
-					st.session_state["_saved_chat_notice"] = "Conversation saved." if operation["action"] == "save" else "Conversation deleted."
+				st.session_state.pop(operation_key)
+				if snapshot.get("error"):
+					st.session_state[notice_key] = {"error": f"Could not update saved {noun}: {snapshot['error']}"}
+				else:
+					st.session_state[notice_key] = {"success": f"{noun.capitalize()} {'saved' if operation['action'] == 'save' else 'deleted'}."}
 				st.rerun()
-		if notice := st.session_state.pop("_saved_chat_notice", None):
-			st.success(notice)
-		if not st.session_state.saved_chats:
-			st.caption("No saved conversations.")
-		for item in st.session_state.saved_chats:
+		if notice := st.session_state.pop(notice_key, None):
+			if isinstance(notice, str):
+				st.success(notice)
+			elif "error" in notice:
+				st.error(notice["error"])
+			else:
+				st.success(notice["success"])
+		if not st.session_state[items_key]:
+			st.caption(f"No saved {noun}s.")
+		for item in st.session_state[items_key]:
 			open_column, delete_column = st.columns([5, 1])
 			with open_column:
-				if st.button(item["question"], key=f"open_saved_{item['id']}", width="stretch", icon=":material/bookmark:"):
-					st.session_state.open_saved_chat = item["id"]
+				if st.button(item[title_field], key=f"open_saved_{kind}_{item['id']}", width="stretch", icon=":material/bookmark:"):
+					st.session_state[open_key] = item["id"]
 			with delete_column:
 				st.button(
-					"", key=f"delete_saved_{item['id']}", icon=":material/delete:",
-					help="Delete saved conversation", disabled=not st.session_state.saved_chats_ready or bool(st.session_state.get("_saved_chat_operation")),
-					on_click=queue_saved_chat_operation, args=("delete", item),
+					"", key=f"delete_saved_{kind}_{item['id']}", icon=":material/delete:",
+					help=f"Delete saved {noun}", disabled=not st.session_state[ready_key] or bool(st.session_state.get(operation_key)),
+					on_click=queue_saved_item_operation, args=("delete", item, kind),
 				)
-	if selected_id := st.session_state.pop("open_saved_chat", None):
-		selected_item = next((item for item in st.session_state.saved_chats if item["id"] == selected_id), None)
+	if selected_id := st.session_state.pop(open_key, None):
+		selected_item = next((item for item in st.session_state[items_key] if item["id"] == selected_id), None)
 		if selected_item:
-			show_saved_chat(selected_item)
+			viewer(selected_item)
+
+
+def export_scope_details(item):
+	scope = item.get("scope", {})
+	return (
+		f"Created: {item.get('created_at', '')}\n"
+		f"Websites: {', '.join(scope.get('files', []))}\n"
+		f"Analysis time range: {scope.get('time_range', 'Not recorded')}"
+	)
 
 
 def conversation_export(item, file_format):
@@ -533,12 +594,7 @@ def conversation_export(item, file_format):
 		source_lines.append(
 			f"[Source {index}] {clean_text(source.get('Title'))} | {clean_text(source.get('Sito'))} | {clean_text(source.get('URL'))}"
 		)
-	scope = item.get("scope", {})
-	details = (
-		f"Created: {item.get('created_at', '')}\n"
-		f"Websites: {', '.join(scope.get('files', []))}\n"
-		f"Analysis time range: {scope.get('time_range', 'Not recorded')}"
-	)
+	details = export_scope_details(item)
 	if file_format == "HTML":
 		sources_html = "".join(f"<li>{escape(line)}</li>" for line in source_lines)
 		return (
@@ -585,13 +641,66 @@ def render_conversation_actions(item, allow_save=True, key_prefix="chat"):
 				help="Remove question and answer from chat history",
 				on_click=remove_chat_exchange, args=(item["id"],),
 			)
-		file_format = st.selectbox("Export format", ["Markdown", "Text", "HTML"], key=f"{key_prefix}_format_{item['id']}", width=160, label_visibility="collapsed")
-		extension, mime = {"Markdown": ("md", "text/markdown"), "Text": ("txt", "text/plain"), "HTML": ("html", "text/html")}[file_format]
-		st.download_button(
-			"Download", icon=":material/download:", data=conversation_export(item, file_format),
-			file_name=f"content_strategy_{item['id']}.{extension}", mime=mime,
-			key=f"{key_prefix}_download_{item['id']}", on_click="ignore",
+		render_export_controls(item, conversation_export, key_prefix, "content_strategy")
+
+
+def render_export_controls(item, export_function, key_prefix, filename_prefix):
+	file_format = st.selectbox("Export format", ["Markdown", "Text", "HTML"], key=f"{key_prefix}_format_{item['id']}", width=160, label_visibility="collapsed")
+	extension, mime = {"Markdown": ("md", "text/markdown"), "Text": ("txt", "text/plain"), "HTML": ("html", "text/html")}[file_format]
+	st.download_button(
+		"Download", icon=":material/download:", data=export_function(item, file_format),
+		file_name=f"{filename_prefix}_{item['id']}.{extension}", mime=mime,
+		key=f"{key_prefix}_download_{item['id']}", on_click="ignore",
+	)
+
+
+def create_report_item(content, frame):
+	created = datetime.now(timezone.utc)
+	return {
+		"id": str(uuid4()),
+		"title": f"Content Strategy Report - {created:%Y-%m-%d %H:%M UTC}",
+		"content": content,
+		"created_at": created.isoformat(),
+		"scope": {"files": sorted(frame["_source_file"].dropna().astype(str).unique(), key=str.casefold),
+			"time_range": analysis_time_range, "articles": len(frame)},
+	}
+
+
+def report_export(item, file_format):
+	details = export_scope_details(item) + f"\nArticles analyzed: {item.get('scope', {}).get('articles', 'Not recorded')}"
+	if file_format == "HTML":
+		return (
+			'<!doctype html><html lang="en"><head><meta charset="utf-8">'
+			'<meta name="viewport" content="width=device-width, initial-scale=1">'
+			f'<title>{escape(item["title"])}</title><style>'
+			'body{font-family:Georgia,serif;max-width:900px;margin:40px auto;padding:0 24px;line-height:1.6;}'
+			'pre{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;}'
+			f'</style></head><body><h1>{escape(item["title"])}</h1><pre>{escape(details)}</pre>'
+			f'<pre>{escape(item["content"])}</pre></body></html>'
 		)
+	if file_format == "Markdown":
+		return f"# {item['title']}\n\n{details}\n\n{item['content']}"
+	return f"{item['title']}\n\n{details}\n\n{item['content']}"
+
+
+def render_report_actions(item, allow_save=True, key_prefix="report"):
+	with st.container(horizontal=True):
+		if allow_save:
+			is_saved = any(saved["id"] == item["id"] for saved in st.session_state.get("saved_reports", []))
+			st.button(
+				"Saved" if is_saved else "Save", icon=":material/bookmark:", key=f"{key_prefix}_save_{item['id']}",
+				disabled=is_saved or not st.session_state.get("saved_reports_ready", False) or bool(st.session_state.get("_saved_report_operation")),
+				on_click=queue_saved_report_operation, args=("save", item),
+			)
+		render_export_controls(item, report_export, key_prefix, "content_strategy_report")
+
+
+@st.dialog("Saved report", width="large")
+def show_saved_report(item):
+	st.subheader(item["title"])
+	st.caption(export_scope_details(item))
+	st.markdown(item["content"])
+	render_report_actions(item, allow_save=False, key_prefix="saved_report")
 
 
 @st.dialog("Saved conversation", width="large")
@@ -838,7 +947,7 @@ def render_chat():
 		elif dataset.empty:
 			st.warning("No articles match the selected time range.")
 		elif (collection := get_indexed_collection()) is None:
-			st.warning("Database not indexed yet. Start ingestion from the sidebar first.")
+			st.warning("The search index is missing or uses an outdated content schema. Start Data Ingestion from the sidebar first.")
 		else:
 			try:
 				with st.spinner("Searching sources and preparing a comparative analysis..."):
@@ -897,18 +1006,16 @@ def render_report(frame):
 						f"AGGREGATED DATA AND ARTICLE SAMPLES:\n{report_context(frame)}"
 					)
 					response = client.models.generate_content(model=CHAT_MODEL, contents=prompt)
-					st.session_state.strategy_report = response.text or "Gemini did not return a text report."
+					st.session_state.strategy_report = create_report_item(response.text or "Gemini did not return a text report.", frame)
 			except Exception as exc:
 				st.error(f"Error while generating the report: {exc}")
 
 	if report := st.session_state.get("strategy_report"):
-		st.markdown(report)
-		st.download_button(
-			"Download Markdown report",
-			data=report,
-			file_name="content_strategy_report.md",
-			mime="text/markdown",
-		)
+		if isinstance(report, str):
+			report = create_report_item(report, frame)
+			st.session_state.strategy_report = report
+		st.markdown(report["content"])
+		render_report_actions(report)
 
 
 files = scan_csv_files()
@@ -1001,6 +1108,7 @@ else:
 with st.sidebar:
 	render_question_preferences_storage()
 render_saved_chats_sidebar()
+render_saved_reports_sidebar()
 
 st.title("Content Intelligence")
 st.caption("Competitive content analysis, semantic search, and editorial strategy.")
