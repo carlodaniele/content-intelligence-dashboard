@@ -1,5 +1,7 @@
 import os
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
@@ -13,6 +15,7 @@ load_dotenv()
 import chromadb
 import pandas as pd
 import plotly.express as px
+import plotly.io as pio
 import streamlit as st
 import streamlit.components.v2 as components
 from streamlit.errors import StreamlitSecretNotFoundError
@@ -30,6 +33,7 @@ CHAT_MODEL = "gemini-2.5-flash"
 EMBEDDING_MODEL = "gemini-embedding-001"
 EMBED_BATCH_SIZE = 64
 CHAT_RESULT_COUNT = 8
+MAX_RETRIEVAL_COSINE_DISTANCE = 0.65
 CONTENT_SCHEMA_VERSION = 2
 REQUIRED_COLUMNS = [
 	"Date published",
@@ -230,6 +234,16 @@ def article_document(row, max_field_chars=None):
 	return "\n".join(lines)
 
 
+def split_category_cell(value):
+	if value is None or pd.isna(value):
+		return []
+	return list(dict.fromkeys(part.strip() for part in str(value).split(";") if part.strip()))
+
+
+def explode_category_values(values):
+	return values.map(split_category_cell).explode().dropna().astype(str).str.strip()
+
+
 @st.cache_resource
 def get_chroma_client():
 	return chromadb.PersistentClient(path=str(CHROMA_DIR))
@@ -256,10 +270,41 @@ def embed_texts(client, texts, task_type):
 	return embeddings
 
 
-def ingest_dataset(frame, gemini_client, progress_callback):
+def format_elapsed_duration(seconds):
+	seconds = max(0, int(seconds))
+	hours, remainder = divmod(seconds, 3600)
+	minutes, seconds = divmod(remainder, 60)
+	return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def run_operation_with_progress(operation, label, status_callback, ingestion_started, poll_interval=1):
+	operation_started = time.monotonic()
+	with ThreadPoolExecutor(max_workers=1) as executor:
+		future = executor.submit(operation)
+		while True:
+			try:
+				result = future.result(timeout=poll_interval)
+				break
+			except FutureTimeoutError:
+				if status_callback:
+					status_callback(
+						f"{label} · running {format_elapsed_duration(time.monotonic() - operation_started)}"
+						f" · total {format_elapsed_duration(time.monotonic() - ingestion_started)}"
+					)
+	if status_callback:
+		status_callback(
+			f"{label} · complete in {format_elapsed_duration(time.monotonic() - operation_started)}"
+			f" · total {format_elapsed_duration(time.monotonic() - ingestion_started)}"
+		)
+	return result
+
+
+def ingest_dataset(frame, gemini_client, progress_callback, status_callback=None):
 	if frame.empty:
 		raise ValueError("There are no valid rows to index in the detected CSV files.")
 
+	ingestion_started = time.monotonic()
+	preparation_started = time.monotonic()
 	documents = []
 	metadatas = []
 	ids = []
@@ -273,17 +318,28 @@ def ingest_dataset(frame, gemini_client, progress_callback):
 		metadatas.append(metadata)
 		source_file = clean_text(row.get("_source_file"))
 		ids.append(f"{source_file}::{row_number}")
+	if status_callback:
+		status_callback(
+			f"Prepared {len(documents)} articles in "
+			f"{format_elapsed_duration(time.monotonic() - preparation_started)}"
+		)
 
 	all_embeddings = []
 	total_batches = (len(documents) + EMBED_BATCH_SIZE - 1) // EMBED_BATCH_SIZE
 	for batch_number, start in enumerate(range(0, len(documents), EMBED_BATCH_SIZE), start=1):
-		batch_embeddings = embed_texts(
-			gemini_client,
-			documents[start : start + EMBED_BATCH_SIZE],
-			"RETRIEVAL_DOCUMENT",
+		progress_callback(0.9 * (batch_number - 1) / total_batches)
+		batch_embeddings = run_operation_with_progress(
+			lambda start=start: embed_texts(
+				gemini_client,
+				documents[start : start + EMBED_BATCH_SIZE],
+				"RETRIEVAL_DOCUMENT",
+			),
+			f"Generating embeddings · batch {batch_number}/{total_batches}",
+			status_callback,
+			ingestion_started,
 		)
 		all_embeddings.extend(batch_embeddings)
-		progress_callback(batch_number / total_batches)
+		progress_callback(0.9 * batch_number / total_batches)
 
 	chroma_client = get_chroma_client()
 	try:
@@ -295,14 +351,24 @@ def ingest_dataset(frame, gemini_client, progress_callback):
 		metadata={"hnsw:space": "cosine", "content_schema_version": CONTENT_SCHEMA_VERSION},
 	)
 
-	for start in range(0, len(documents), EMBED_BATCH_SIZE):
+	storage_batches = (len(documents) + EMBED_BATCH_SIZE - 1) // EMBED_BATCH_SIZE
+	for batch_number, start in enumerate(range(0, len(documents), EMBED_BATCH_SIZE), start=1):
 		end = start + EMBED_BATCH_SIZE
-		collection.add(
-			ids=ids[start:end],
-			embeddings=all_embeddings[start:end],
-			documents=documents[start:end],
-			metadatas=metadatas[start:end],
+		progress_callback(0.9 + 0.1 * (batch_number - 1) / storage_batches)
+		run_operation_with_progress(
+			lambda start=start, end=end: collection.add(
+				ids=ids[start:end],
+				embeddings=all_embeddings[start:end],
+				documents=documents[start:end],
+				metadatas=metadatas[start:end],
+			),
+			f"Saving indexed articles · batch {batch_number}/{storage_batches}",
+			status_callback,
+			ingestion_started,
 		)
+		progress_callback(0.9 + 0.1 * batch_number / storage_batches)
+	if status_callback:
+		status_callback(f"Ingestion complete · total {format_elapsed_duration(time.monotonic() - ingestion_started)}")
 	return collection.count()
 
 
@@ -354,8 +420,7 @@ def report_context(frame):
 		if not stages.empty:
 			lines.append("Funnel distribution (%): " + ", ".join(f"{name} {value * 100:.1f}%" for name, value in stages.items()))
 		for column in ("Topics", "Post type", "Vertical", "Buyer persona", "Strategic initiative", "Features Mentioned", "Target audience"):
-			counts = group[column].dropna().astype(str).str.strip()
-			counts = counts[counts.ne("")].value_counts().head(6)
+			counts = explode_category_values(group[column]).value_counts().head(6)
 			if not counts.empty:
 				lines.append(f"Most frequent {column} values: " + "; ".join(f"{name} ({count})" for name, count in counts.items()))
 
@@ -371,20 +436,38 @@ def report_context(frame):
 	return "\n".join(lines)
 
 
-def render_dashboard(frame):
+def topic_frequency_context(frame):
+	lines = ["Complete article counts by exact Topics value and website:"]
+	for site, group in frame.groupby("Sito", sort=True):
+		counts = explode_category_values(group["Topics"]).value_counts()
+		article_count = group["Topics"].map(split_category_cell).map(bool).sum()
+		lines.append(f"\nWebsite: {site}; articles with a populated Topics value: {int(article_count)}")
+		lines.extend(f"- {topic}: {count}" for topic, count in counts.items())
+	return "\n".join(lines)
+
+
+def build_dashboard_topic_chart(frame, dimension="Topics", selected_site="All websites"):
+	topic_data = frame if selected_site == "All websites" else frame[frame["Sito"] == selected_site]
+	topic_values = explode_category_values(topic_data[dimension]).value_counts().head(15).sort_values()
+	if topic_values.empty:
+		return None
+	topic_frame = topic_values.rename_axis(dimension).reset_index(name="Articles")
+	topic_figure = px.bar(
+		topic_frame, x="Articles", y=dimension, orientation="h", color="Articles",
+		color_continuous_scale="Viridis", title=f"Most Frequent {dimension}",
+	)
+	topic_figure.update_layout(coloraxis_showscale=False, yaxis_title="", xaxis_title="Articles")
+	return topic_figure
+
+
+def build_dashboard_charts(frame, dimension="Topics", selected_site="All websites", include_topics=True):
+	figures = {}
 	if frame.empty:
-		st.info("Add valid CSV files to the `data/` folder to view the dashboard.")
-		return
+		return figures
 
-	site_count = frame["Sito"].nunique()
-	article_count = len(frame)
-	topic_count = frame["Topics"].dropna().nunique()
-	metric_columns = st.columns(3)
-	metric_columns[0].metric("Websites", site_count)
-	metric_columns[1].metric("Articles", article_count)
-	metric_columns[2].metric("Unique topics", topic_count)
-
-	funnel = frame[["Sito", "Funnel stage"]].dropna().copy().rename(columns={"Sito": "Website"})
+	funnel = frame[["Sito", "Funnel stage"]].dropna(subset=["Sito"]).copy().rename(columns={"Sito": "Website"})
+	funnel["Funnel stage"] = funnel["Funnel stage"].map(split_category_cell)
+	funnel = funnel.explode("Funnel stage").dropna(subset=["Funnel stage"])
 	funnel["Funnel stage"] = (
 		funnel["Funnel stage"].astype(str).str.strip().str.upper().str.replace(r"\s+", " ", regex=True)
 		.replace({"TOP OF FUNNEL": "TOFU", "MIDDLE OF FUNNEL": "MOFU", "BOTTOM OF FUNNEL": "BOFU"})
@@ -396,66 +479,30 @@ def render_dashboard(frame):
 			funnel_counts["Articles"] / funnel_counts.groupby("Website")["Articles"].transform("sum") * 100
 		)
 		funnel_figure = px.bar(
-			funnel_counts,
-			x="Website",
-			y="Percentage",
-			color="Funnel stage",
-			category_orders={"Funnel stage": ["TOFU", "MOFU", "BOFU"]},
-			barmode="stack",
+			funnel_counts, x="Website", y="Percentage", color="Funnel stage",
+			category_orders={"Funnel stage": ["TOFU", "MOFU", "BOFU"]}, barmode="stack",
 			color_discrete_sequence=px.colors.qualitative.Vivid,
 			title="Funnel Stage Distribution by Website",
 			labels={"Percentage": "Articles (%)", "Website": "Website"},
 			hover_data={"Articles": True, "Percentage": ":.1f"},
 		)
 		funnel_figure.update_layout(yaxis_range=[0, 100], yaxis_ticksuffix="%", legend_title_text="Funnel stage")
-		st.plotly_chart(funnel_figure, width="stretch")
-	else:
-		st.info("No funnel stage data is available.")
-	st.divider()
+		figures["Funnel Stage Distribution by Website"] = funnel_figure
 
-	sites = sorted(frame["Sito"].dropna().astype(str).unique(), key=str.casefold)
-	dimension = st.selectbox("Analyze by", ["Topics", "Post type", "Vertical", "Buyer persona", "Strategic initiative", "Features Mentioned", "Target audience"], key="topic_dimension")
-	selected_site = st.selectbox("Website for most frequent values", ["All websites"] + sites)
-	topic_data = frame.copy()
-	if selected_site != "All websites":
-		topic_data = topic_data[topic_data["Sito"] == selected_site]
-	topic_values = topic_data[dimension].dropna().astype(str).str.strip()
-	topic_values = topic_values[topic_values.ne("")].value_counts().head(15).sort_values()
-	if not topic_values.empty:
-		topic_frame = topic_values.rename_axis(dimension).reset_index(name="Articles")
-		topic_figure = px.bar(
-			topic_frame,
-			x="Articles",
-			y=dimension,
-			orientation="h",
-			color="Articles",
-			color_continuous_scale="Viridis",
-			title=f"Most Frequent {dimension}",
-		)
-		topic_figure.update_layout(coloraxis_showscale=False, yaxis_title="", xaxis_title="Articles")
-		st.plotly_chart(topic_figure, width="stretch")
-	else:
-		st.info(f"No {dimension.lower()} values are available for this selection.")
-	st.divider()
+	if include_topics:
+		if topic_figure := build_dashboard_topic_chart(frame, dimension, selected_site):
+			figures[f"Most Frequent {dimension}"] = topic_figure
 
 	lengths = frame[["Sito"]].copy().rename(columns={"Sito": "Website"})
 	lengths["Article length"] = article_length_series(frame)
 	lengths = lengths.dropna(subset=["Article length"])
 	if not lengths.empty:
 		length_figure = px.box(
-			lengths,
-			x="Website",
-			y="Article length",
-			color="Website",
-			points="outliers",
-			color_discrete_sequence=px.colors.qualitative.Prism,
-			title="Article Length Comparison",
+			lengths, x="Website", y="Article length", color="Website", points="outliers",
+			color_discrete_sequence=px.colors.qualitative.Prism, title="Article Length Comparison",
 		)
 		length_figure.update_layout(showlegend=False, xaxis_title="Website", yaxis_title="Word count")
-		st.plotly_chart(length_figure, width="stretch")
-	else:
-		st.info("The `Word count` column does not contain usable numeric values.")
-	st.divider()
+		figures["Article Length Comparison"] = length_figure
 
 	dated_articles = frame.dropna(subset=["Date published"]).copy()
 	if not dated_articles.empty:
@@ -464,15 +511,10 @@ def render_dashboard(frame):
 		)
 		monthly_publications = (
 			dated_articles.groupby(["Publication month", "Sito"], as_index=False)
-			.size()
-			.rename(columns={"Sito": "Website", "size": "Articles"})
+			.size().rename(columns={"Sito": "Website", "size": "Articles"})
 		)
 		publication_figure = px.line(
-			monthly_publications,
-			x="Publication month",
-			y="Articles",
-			color="Website",
-			markers=True,
+			monthly_publications, x="Publication month", y="Articles", color="Website", markers=True,
 			color_discrete_sequence=px.colors.qualitative.Vivid,
 			title="Editorial Publishing Velocity",
 			labels={"Publication month": "Month ending", "Articles": "Articles published"},
@@ -480,15 +522,55 @@ def render_dashboard(frame):
 		month_end_ticks = monthly_publications["Publication month"].drop_duplicates().sort_values()
 		last_month_end = month_end_ticks.iloc[-1]
 		publication_figure.update_xaxes(
-			tickmode="array",
-			tickvals=month_end_ticks.tolist(),
-			ticktext=month_end_ticks.dt.strftime("%b %Y").tolist(),
+			tickmode="array", tickvals=month_end_ticks.tolist(), ticktext=month_end_ticks.dt.strftime("%b %Y").tolist(),
 		)
 		publication_figure.update_layout(
 			title=f"Editorial Publishing Velocity (through {last_month_end:%B %d, %Y})",
 			legend_title_text="Website",
 		)
-		st.plotly_chart(publication_figure, width="stretch")
+		figures["Editorial Publishing Velocity"] = publication_figure
+	return figures
+
+
+def render_dashboard(frame):
+	if frame.empty:
+		st.info("Add valid CSV files to the `data/` folder to view the dashboard.")
+		return
+
+	metric_columns = st.columns(3)
+	metric_columns[0].metric("Websites", frame["Sito"].nunique())
+	metric_columns[1].metric("Articles", len(frame))
+	metric_columns[2].metric("Unique topics", frame["Topics"].dropna().nunique())
+
+	figures = build_dashboard_charts(frame, include_topics=False)
+
+	if figure := figures.get("Funnel Stage Distribution by Website"):
+		st.plotly_chart(figure, width="stretch")
+	else:
+		st.info("No funnel stage data is available.")
+	st.divider()
+
+	sites = sorted(frame["Sito"].dropna().astype(str).unique(), key=str.casefold)
+	dimension = st.selectbox(
+		"Analyze by",
+		["Topics", "Post type", "Vertical", "Buyer persona", "Strategic initiative", "Features Mentioned", "Target audience"],
+		key="topic_dimension",
+	)
+	selected_site = st.selectbox("Website for most frequent values", ["All websites"] + sites)
+	if figure := build_dashboard_topic_chart(frame, dimension, selected_site):
+		st.plotly_chart(figure, width="stretch")
+	else:
+		st.info(f"No {dimension.lower()} values are available for this selection.")
+	st.divider()
+
+	if figure := figures.get("Article Length Comparison"):
+		st.plotly_chart(figure, width="stretch")
+	else:
+		st.info("The `Word count` column does not contain usable numeric values.")
+	st.divider()
+
+	if figure := figures.get("Editorial Publishing Velocity"):
+		st.plotly_chart(figure, width="stretch")
 	else:
 		st.info("No valid publication dates are available for the selected range.")
 
@@ -654,12 +736,13 @@ def render_export_controls(item, export_function, key_prefix, filename_prefix):
 	)
 
 
-def create_report_item(content, frame):
+def create_report_item(content, frame, title=None, charts=None):
 	created = datetime.now(timezone.utc)
 	return {
 		"id": str(uuid4()),
-		"title": f"Content Strategy Report - {created:%Y-%m-%d %H:%M UTC}",
+		"title": title or f"Content Strategy Report - {created:%Y-%m-%d %H:%M UTC}",
 		"content": content,
+		"charts": charts or {},
 		"created_at": created.isoformat(),
 		"scope": {"files": sorted(frame["_source_file"].dropna().astype(str).unique(), key=str.casefold),
 			"time_range": analysis_time_range, "articles": len(frame)},
@@ -669,6 +752,10 @@ def create_report_item(content, frame):
 def report_export(item, file_format):
 	details = export_scope_details(item) + f"\nArticles analyzed: {item.get('scope', {}).get('articles', 'Not recorded')}"
 	if file_format == "HTML":
+		charts_html = "".join(
+			pio.to_html(pio.from_json(chart_json), full_html=False, include_plotlyjs="cdn" if index == 0 else False)
+			for index, chart_json in enumerate(item.get("charts", {}).values())
+		)
 		return (
 			'<!doctype html><html lang="en"><head><meta charset="utf-8">'
 			'<meta name="viewport" content="width=device-width, initial-scale=1">'
@@ -676,7 +763,7 @@ def report_export(item, file_format):
 			'body{font-family:Georgia,serif;max-width:900px;margin:40px auto;padding:0 24px;line-height:1.6;}'
 			'pre{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;}'
 			f'</style></head><body><h1>{escape(item["title"])}</h1><pre>{escape(details)}</pre>'
-			f'<pre>{escape(item["content"])}</pre></body></html>'
+			f'<pre>{escape(item["content"])}</pre>{charts_html}</body></html>'
 		)
 	if file_format == "Markdown":
 		return f"# {item['title']}\n\n{details}\n\n{item['content']}"
@@ -695,11 +782,18 @@ def render_report_actions(item, allow_save=True, key_prefix="report"):
 		render_export_controls(item, report_export, key_prefix, "content_strategy_report")
 
 
+def render_report_visuals(item, key_prefix):
+	for index, (title, chart_json) in enumerate(item.get("charts", {}).items()):
+		st.subheader(title)
+		st.plotly_chart(pio.from_json(chart_json), width="stretch", key=f"{key_prefix}_chart_{index}")
+
+
 @st.dialog("Saved report", width="large")
 def show_saved_report(item):
 	st.subheader(item["title"])
 	st.caption(export_scope_details(item))
 	st.markdown(item["content"])
+	render_report_visuals(item, "saved_report")
 	render_report_actions(item, allow_save=False, key_prefix="saved_report")
 
 
@@ -715,12 +809,22 @@ def show_saved_chat(item):
 	render_conversation_actions(item, allow_save=False, key_prefix="saved")
 
 
-def generate_chat_answer(prompt, collection):
-	allowed_document_ids = {
-		f"{clean_text(row['_source_file'])}::{row_number}"
-		for row_number, row in dataset.iterrows()
+def is_current_relevant_result(document_id, document, distance, current_documents):
+	return (
+		document_id in current_documents
+		and document == current_documents[document_id]
+		and distance is not None
+		and distance <= MAX_RETRIEVAL_COSINE_DISTANCE
+	)
+
+
+def generate_chat_answer(prompt, collection, frame=None, report_mode=False):
+	source_frame = frame if frame is not None else dataset
+	current_documents = {
+		f"{clean_text(row['_source_file'])}::{row_number}": article_document(row)
+		for row_number, row in source_frame.iterrows()
 	}
-	if not allowed_document_ids:
+	if not current_documents:
 		return None
 	indexed_count = collection.count()
 	if not indexed_count:
@@ -729,7 +833,7 @@ def generate_chat_answer(prompt, collection):
 	query_embedding = embed_texts(client, [prompt], "RETRIEVAL_QUERY")[0]
 	mentioned_sites = [
 		site
-		for site in sorted(dataset["Sito"].dropna().astype(str).unique(), key=len, reverse=True)
+		for site in sorted(source_frame["Sito"].dropna().astype(str).unique(), key=len, reverse=True)
 		if re.search(rf"(?<!\w){re.escape(site)}(?!\w)", prompt, flags=re.IGNORECASE)
 	]
 	candidates = []
@@ -750,7 +854,7 @@ def generate_chat_answer(prompt, collection):
 				site_results.get("metadatas", [[]])[0],
 				site_results.get("distances", [[]])[0],
 			):
-				if document_id in allowed_document_ids:
+				if is_current_relevant_result(document_id, document, distance, current_documents):
 					site_candidates.append((distance, document, metadata))
 			site_candidates.sort(key=lambda item: item[0])
 			candidates.extend(site_candidates[:per_site])
@@ -765,12 +869,13 @@ def generate_chat_answer(prompt, collection):
 		)
 		filtered_results = [
 			(document, metadata)
-			for document_id, document, metadata in zip(
+			for document_id, document, metadata, distance in zip(
 				results.get("ids", [[]])[0],
 				results.get("documents", [[]])[0],
 				results.get("metadatas", [[]])[0],
+				results.get("distances", [[]])[0],
 			)
-			if document_id in allowed_document_ids
+			if is_current_relevant_result(document_id, document, distance, current_documents)
 		][:CHAT_RESULT_COUNT]
 		documents = [item[0] for item in filtered_results]
 		metadatas = [item[1] for item in filtered_results]
@@ -786,14 +891,40 @@ def generate_chat_answer(prompt, collection):
 			f"Title: {metadata.get('Title', '')}; URL: {metadata.get('URL', '')}\n{document}"
 		)
 
+	if report_mode:
+		answer_guidance = (
+			"You are a content strategy analyst writing a concise, report-ready answer in US English. "
+			"Do not browse the web or use outside knowledge. Treat the supplied dataset and retrieved "
+			"sources as the only facts available. If the evidence does not directly answer the question, "
+			"say that the selected data is insufficient instead of guessing. Cite exact dataset counts as "
+			"[Dataset counts] and qualitative facts with valid [Source N] references. "
+			"Do not provide article-title lists. Prefer useful counts or percentages by website. "
+			"Use the complete exact Topics-value frequency table for counts about topics; do not infer "
+			"whole-dataset counts from the retrieved source sample. If the table cannot support an exact "
+			"count, say so clearly. Do not present unsupported assumptions as facts."
+		)
+		additional_context = "\n\n" + topic_frequency_context(source_frame)
+	else:
+		answer_guidance = (
+			"You are a content strategy analyst. Respond in US English with a detailed, practical comparison "
+			"based only on the provided sources. Distinguish facts from inferences, note when the data is "
+			"insufficient, and cite sources in the answer as [Source 1]."
+		)
+		additional_context = ""
 	answer_prompt = (
-		"You are a content strategy analyst. Respond in US English with a detailed, practical comparison "
-		"based only on the provided sources. Distinguish facts from inferences, note when the data is "
-		"insufficient, and cite sources in the answer as [Source 1].\n\n"
-		f"QUESTION:\n{prompt}\n\nRETRIEVED CONTEXT:\n" + "\n\n".join(context_blocks)
+		f"{answer_guidance}\n\nQUESTION:\n{prompt}\n\nRETRIEVED CONTEXT:\n"
+		+ "\n\n".join(context_blocks) + additional_context
 	)
 	response = client.models.generate_content(model=CHAT_MODEL, contents=answer_prompt)
-	return response.text or "Gemini did not return a text response.", sources
+	answer = response.text or ""
+	source_citations = [int(index) for index in re.findall(r"\[Source\s+(\d+)\]", answer)]
+	if (
+		not answer.strip()
+		or any(index < 1 or index > len(sources) for index in source_citations)
+		or (not source_citations and not (report_mode and "[Dataset counts]" in answer))
+	):
+		return "The selected data does not provide enough verified evidence to answer this question.", []
+	return answer, sources
 
 
 def queue_question_preference_operation(action, question=None):
@@ -1018,6 +1149,127 @@ def render_report(frame):
 		render_report_actions(report)
 
 
+def custom_report_content(title, answers, frame, chart_titles):
+	lines = [
+		f"# {title}",
+		"",
+		f"Websites analyzed: {frame['Sito'].nunique()}",
+		f"Articles analyzed: {len(frame)}",
+		f"Analysis time range: {analysis_time_range}",
+		"",
+		"## Custom analysis",
+	]
+	for index, answer in enumerate(answers, start=1):
+		lines.extend(["", f"### Question {index}: {answer['question']}", "", answer["answer"]])
+		sources = answer.get("sources", [])
+		if sources:
+			lines.extend(["", "Sources:"])
+			for source_index, source in enumerate(sources, start=1):
+				title_text = clean_text(source.get("Title")) or "Untitled article"
+				site = clean_text(source.get("Sito")) or "Website"
+				url = str(source.get("URL", "")).replace("(", "%28").replace(")", "%29")
+				label = f"Source {source_index}: {site} - {title_text}"
+				lines.append(f"- [{label}]({url})" if url else f"- {label}")
+	if chart_titles:
+		lines.extend(["", "## Included charts", ""])
+		lines.extend(f"- {chart_title}" for chart_title in chart_titles)
+	return "\n".join(lines)
+
+
+def remove_custom_report_question(question_id):
+	st.session_state.custom_report_answers = [
+		answer for answer in st.session_state.get("custom_report_answers", []) if answer["id"] != question_id
+	]
+	st.session_state.pop(f"custom_report_include_{question_id}", None)
+
+
+def render_custom_report(frame):
+	st.session_state.setdefault("custom_report_answers", [])
+	st.subheader("Ask questions")
+	st.caption("Answers use the selected websites and time range. Topic counts are computed from all selected articles.")
+
+	with st.form("custom_report_question_form", clear_on_submit=True):
+		question = st.text_area(
+			"Question", max_chars=1000, key="custom_report_question_input",
+			placeholder="How does each competitor use AI in its content strategy?",
+		)
+		question_submitted = st.form_submit_button("Generate answer", icon=":material/auto_awesome:")
+
+	if question_submitted:
+		if not question.strip():
+			st.warning("Enter a question first.")
+		elif not GEMINI_API_KEY:
+			st.error("API key not found in the .env file. Check your configuration.")
+		elif frame.empty:
+			st.warning("No articles match the selected websites and time range.")
+		elif (collection := get_indexed_collection()) is None:
+			st.warning("The search index is missing or outdated. Start Data Ingestion from the sidebar first.")
+		else:
+			try:
+				with st.spinner("Gemini is preparing a report-ready answer..."):
+					result = generate_chat_answer(question.strip(), collection, frame=frame, report_mode=True)
+				if result is None:
+					st.warning("No indexed articles match this question. Run data ingestion to refresh the index.")
+				else:
+					answer, sources = result
+					st.session_state.custom_report_answers.append({
+						"id": str(uuid4()), "question": question.strip(), "answer": answer, "sources": sources,
+						"include": True, "created_at": datetime.now(timezone.utc).isoformat(),
+					})
+			except Exception as exc:
+				st.error(f"Error while preparing the answer: {exc}")
+
+	answers = st.session_state.custom_report_answers
+	selected_answers = []
+	for index, answer in enumerate(answers, start=1):
+		with st.container(border=True):
+			st.markdown(f"**Question {index}:** {answer['question']}")
+			st.markdown(answer["answer"])
+			render_sources(answer.get("sources", []), key_prefix=f"custom_report_{answer['id']}")
+			include = st.checkbox(
+				"Include in report", value=answer.get("include", True),
+				key=f"custom_report_include_{answer['id']}",
+			)
+			answer["include"] = include
+			if include:
+				selected_answers.append(answer)
+			st.button(
+				"Remove question", icon=":material/delete:", key=f"custom_report_remove_{answer['id']}",
+				on_click=remove_custom_report_question, args=(answer["id"],),
+			)
+
+	st.divider()
+	st.subheader("Charts")
+	dimensions = ["Topics", "Post type", "Vertical", "Buyer persona", "Strategic initiative", "Features Mentioned", "Target audience"]
+	dimension = st.selectbox("Break down by", dimensions, key="custom_report_dimension")
+	sites = sorted(frame["Sito"].dropna().astype(str).unique(), key=str.casefold) if not frame.empty else []
+	selected_site = st.selectbox("Website for frequency chart", ["All websites"] + sites, key="custom_report_site")
+	figures = build_dashboard_charts(frame, dimension, selected_site)
+	chart_titles = list(figures)
+	selected_chart_titles = st.multiselect(
+		"Include charts", chart_titles, default=chart_titles, key="custom_report_charts",
+	)
+	if not chart_titles:
+		st.info("No charts are available for the selected data.")
+
+	st.text_input("Report title", key="custom_report_title", max_chars=120)
+	if st.button("Generate custom report", type="primary", icon=":material/description:", disabled=not selected_answers):
+		title = st.session_state.custom_report_title.strip() or "Custom Content Strategy Report"
+		selected_figures = {name: figures[name].to_json() for name in selected_chart_titles}
+		content = custom_report_content(title, selected_answers, frame, selected_chart_titles)
+		st.session_state.custom_strategy_report = create_report_item(
+			content, frame, title=title, charts=selected_figures,
+		)
+
+	if report := st.session_state.get("custom_strategy_report"):
+		st.divider()
+		st.subheader(report["title"])
+		st.caption(export_scope_details(report))
+		st.markdown(report["content"])
+		render_report_visuals(report, "custom_report")
+		render_report_actions(report, key_prefix="custom_report")
+
+
 files = scan_csv_files()
 all_dataset, all_csv_errors = load_dataset(files)
 with st.sidebar:
@@ -1055,17 +1307,24 @@ if ingest_clicked:
 		st.error("No valid selected CSV files to index. Check the columns and file formatting.")
 	else:
 		progress_bar = st.progress(0, text="Preparing ingestion...")
+		progress_status = st.empty()
+		ingestion_started = time.monotonic()
 		try:
 			client = get_genai_client(GEMINI_API_KEY)
 			indexed_count = ingest_dataset(
 				selected_dataset,
 				client,
-				lambda value: progress_bar.progress(value, text="Generating embeddings..."),
+				lambda value: progress_bar.progress(value, text="Indexing selected articles..."),
+				progress_status.caption,
 			)
 			progress_bar.empty()
+			progress_status.empty()
 			st.success(f"Ingestion complete: {indexed_count} articles indexed.")
 		except Exception as exc:
 			progress_bar.empty()
+			progress_status.error(
+				f"Ingestion failed after {format_elapsed_duration(time.monotonic() - ingestion_started)}."
+			)
 			st.error(f"Error during ingestion: {exc}")
 
 max_date = selected_dataset["Date published"].max() if not selected_dataset.empty else pd.NaT
@@ -1076,6 +1335,8 @@ active_analysis_scope = (tuple(path.name for path in selected_files), analysis_t
 if st.session_state.get("_active_analysis_scope") != active_analysis_scope:
 	st.session_state.messages = []
 	st.session_state.pop("strategy_report", None)
+	st.session_state.custom_report_answers = []
+	st.session_state.pop("custom_strategy_report", None)
 	st.session_state["_active_analysis_scope"] = active_analysis_scope
 
 dataset = selected_dataset.copy()
@@ -1117,8 +1378,8 @@ if not GEMINI_API_KEY:
 for csv_error in csv_errors:
 	st.warning(csv_error)
 
-dashboard_tab, chat_tab, report_tab = st.tabs(
-	["📊 Quantitative Dashboard", "🤖 AI Assistant & Comparative Chat", "📄 Strategic Report Generator"],
+dashboard_tab, chat_tab, report_tab, custom_report_tab = st.tabs(
+	["📊 Quantitative Dashboard", "🤖 AI Assistant & Comparative Chat", "📄 Strategic Report Generator", "🧩 Build custom report"],
 	key="content_views", on_change="rerun",
 )
 
@@ -1130,3 +1391,6 @@ with chat_tab:
 
 with report_tab:
 	render_report(dataset)
+
+with custom_report_tab:
+	render_custom_report(dataset)

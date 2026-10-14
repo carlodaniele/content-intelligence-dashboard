@@ -1,6 +1,9 @@
 import ast
+import threading
+import time
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -11,11 +14,14 @@ import plotly.express as px
 
 def dataset_functions():
 	module = ast.parse((Path(__file__).resolve().parents[1] / "app.py").read_text())
-	function_names = {"load_dataset", "clean_text", "metadata_value", "article_length_series", "article_document", "report_context", "render_dashboard", "ingest_dataset", "get_indexed_collection"}
+	function_names = {"load_dataset", "clean_text", "metadata_value", "article_length_series", "article_document", "split_category_cell", "explode_category_values", "report_context", "topic_frequency_context", "build_dashboard_topic_chart", "build_dashboard_charts", "render_dashboard", "format_elapsed_duration", "run_operation_with_progress", "ingest_dataset", "get_indexed_collection"}
 	constant_names = {"REQUIRED_COLUMNS", "CONTENT_SCHEMA_VERSION", "COLLECTION_NAME", "EMBED_BATCH_SIZE", "CHAT_RESULT_COUNT"}
 	nodes = [node for node in module.body if isinstance(node, ast.FunctionDef) and node.name in function_names
 		or isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id in constant_names for target in node.targets)]
-	namespace = {"pd": pd, "px": px}
+	namespace = {
+		"pd": pd, "px": px, "time": time, "ThreadPoolExecutor": ThreadPoolExecutor,
+		"FutureTimeoutError": FutureTimeoutError,
+	}
 	exec(compile(ast.Module(body=nodes, type_ignores=[]), "app.py", "exec"), namespace)
 	return namespace
 
@@ -46,6 +52,24 @@ class DatasetSchemaTests(unittest.TestCase):
 		self.assertEqual(counts.iloc[:2].tolist(), [1250, 800])
 		self.assertTrue(counts.iloc[2:].isna().all())
 
+	def test_operation_progress_updates_while_work_is_running(self):
+		release_operation = threading.Event()
+		statuses = []
+		def operation():
+			release_operation.wait(timeout=2)
+			return "complete"
+		def update_status(message):
+			statuses.append(message)
+			if "running" in message:
+				release_operation.set()
+		started = time.monotonic()
+		result = self.functions["run_operation_with_progress"](
+			operation, "Generating embeddings · batch 1/2", update_status, started, poll_interval=0.01,
+		)
+		self.assertEqual(result, "complete")
+		self.assertTrue(any("running" in message and "total" in message for message in statuses))
+		self.assertIn("complete in", statuses[-1])
+
 	def test_documents_and_report_use_all_context(self):
 		document = self.functions["article_document"](self.row)
 		context = self.functions["report_context"](self.frame)
@@ -54,6 +78,25 @@ class DatasetSchemaTests(unittest.TestCase):
 			self.assertIn(f"{column}:", context)
 		self.assertIn("Average word count: 1250.0", context)
 		self.assertNotIn("nan", self.functions["article_document"]({"Title": "Example", "Solution": float("nan")}))
+
+	def test_topic_frequency_context_counts_all_rows_by_website(self):
+		frame = pd.DataFrame({
+			"Sito": ["Alpha", "Alpha", "Alpha", "Beta", "Beta"],
+			"Topics": ["AI", "AI", "SEO", "AI", ""],
+		})
+		context = self.functions["topic_frequency_context"](frame)
+		self.assertIn("Website: Alpha; articles with a populated Topics value: 3", context)
+		self.assertIn("- AI: 2", context)
+		self.assertIn("Website: Beta; articles with a populated Topics value: 1", context)
+
+	def test_semicolon_separated_categories_are_counted_individually(self):
+		frame = pd.DataFrame({
+			"Sito": ["Alpha", "Alpha", "Alpha"],
+			"Topics": ["AI; SEO", "AI", "SEO; SEO"],
+		})
+		figure = self.functions["build_dashboard_topic_chart"](frame, "Topics")
+		counts = dict(zip(figure.data[0].y, figure.data[0].x))
+		self.assertEqual(counts, {"AI": 2, "SEO": 2})
 
 	def test_dashboard_dimensions(self):
 		figures = []
